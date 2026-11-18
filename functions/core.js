@@ -1,10 +1,10 @@
-'use strict';
+ 'use strict';
 /**
  * VirtuEdge Calendly sync: core logic (no Firebase or network code in here, so it can be tested).
  * Every few minutes it asks Calendly for recent bookings and cancellations and writes them into the
  * candidate records the tracker app reads. Works with a FREE Calendly plan (it only reads the API).
  */
- 
+
 const EARLY_STAGES = ['', 'New Lead', 'Awaiting Discovery Call'];
 const US_STATES = {
   AL: 'Alabama', AK: 'Alaska', AZ: 'Arizona', AR: 'Arkansas', CA: 'California', CO: 'Colorado', CT: 'Connecticut', DE: 'Delaware',
@@ -15,11 +15,11 @@ const US_STATES = {
   PA: 'Pennsylvania', RI: 'Rhode Island', SC: 'South Carolina', SD: 'South Dakota', TN: 'Tennessee', TX: 'Texas', UT: 'Utah',
   VT: 'Vermont', VA: 'Virginia', WA: 'Washington', WV: 'West Virginia', WI: 'Wisconsin', WY: 'Wyoming'
 };
- 
+
 const uuidOf = uri => String(uri || '').split('/').pop();
 const emailKey = v => String(v || '').trim().toLowerCase();
 const dayIn = (tz, date) => new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
- 
+
 function splitName(inv) {
   const first = String(inv.first_name || '').trim(), last = String(inv.last_name || '').trim();
   if (first || last) return { firstName: first, lastName: last };
@@ -41,7 +41,7 @@ function parsePhone(inv) { return String(inv.text_reminder_number || '').trim() 
 const nextNumber = ids => ids.map(id => { const m = /^VE-(\d{1,6})$/.exec(String(id)); return m ? parseInt(m[1], 10) : NaN; }).filter(n => !isNaN(n)).reduce((a, b) => Math.max(a, b), 0) + 1;
 const fmtId = n => 'VE-' + String(n).padStart(4, '0');
 const pushHistory = (old, entry) => [...(Array.isArray(old) ? old : []).slice(-59), entry];
- 
+
 async function listAll(api, firstPath) {
   const out = []; let path = firstPath, pages = 0;
   while (path && pages < 5) {
@@ -50,13 +50,13 @@ async function listAll(api, firstPath) {
   }
   return out;
 }
- 
+
 async function runSync({ api, db, now = new Date(), tz = 'America/New_York', log = console }) {
   const stats = { checked: 0, updated: 0, created: 0, canceled: 0, skipped: 0, errors: 0 };
   const state = await db.getState();
   state.processed = state.processed || {};
   if (!state.userUri) state.userUri = (await api('/users/me')).resource.uri;
- 
+
   const minStart = new Date(now.getTime() - 6 * 3600 * 1000).toISOString();
   const events = [];
   for (const status of ['active', 'canceled']) {
@@ -66,7 +66,7 @@ async function runSync({ api, db, now = new Date(), tz = 'America/New_York', log
   stats.checked = events.length;
   const todo = events.filter(e => (state.processed[uuidOf(e.uri)] || {}).s !== e.status)
     .sort((a, b) => (a.status === b.status ? String(a.start_time).localeCompare(String(b.start_time)) : (a.status === 'active' ? -1 : 1)));
- 
+
   if (todo.length) {
     let cands = await db.listCandidates();   // [{id,data}] including archived people. Only read when something changed.
     const today = dayIn(tz, now);
@@ -83,6 +83,7 @@ async function runSync({ api, db, now = new Date(), tz = 'America/New_York', log
           if (live) {
             const d = live.data, patch = { callAt: e.start_time, callSource: 'calendly', callEventUri: e.uri };
             if (EARLY_STAGES.includes(d.stage || '')) { patch.stage = 'Call Booked'; patch.stageHistory = pushHistory(d.stageHistory, { d: today, f: d.stage || '', t: 'Call Booked', by: 'calendly-sync' }); }
+            if (/^Call canceled/i.test(String(d.nextAction || '')) && !d.cancelCount) Object.assign(patch, { cancelCount: '1', cancelBy: 'invitee', cancelAt: d.nextFollowUp || today });   // keep the count of a cancel made before cancel counts existed
             if (!String(d.nextAction || '').trim() || /^Call canceled/i.test(String(d.nextAction))) { patch.nextAction = 'Run the discovery call'; patch.nextFollowUp = ''; }
             await db.updateCandidate(live.id, patch); Object.assign(d, patch); stats.updated++;
           } else if (same.length) {
@@ -117,7 +118,8 @@ async function runSync({ api, db, now = new Date(), tz = 'America/New_York', log
             const d = hit.data, st = d.stage || '';
             const patch = { callAt: '', callSource: '', callEventUri: '' };
             if (EARLY_STAGES.includes(st) || st === 'Call Booked') {   // only people still waiting for their first call are counted
-              const n = (parseInt(d.cancelCount || '0', 10) || 0) + 1;
+              const before = parseInt(d.cancelCount || '0', 10) || (/^Call canceled/i.test(String(d.nextAction || '')) ? 1 : 0);
+              const n = before + 1;
               Object.assign(patch, { cancelCount: String(n), cancelBy: by, cancelReason: reason, cancelAt: today });
               if (by === 'host' || n >= 2) {
                 const to = by === 'host' ? 'Closed - Ineligible' : 'Closed - Canceled';
@@ -140,6 +142,5 @@ async function runSync({ api, db, now = new Date(), tz = 'America/New_York', log
   await db.setState(state);
   return stats;
 }
- 
+
 module.exports = { runSync, parseState, parsePhone, splitName, nextNumber, fmtId, uuidOf, EARLY_STAGES };
- 
